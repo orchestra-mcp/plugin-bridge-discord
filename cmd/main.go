@@ -9,31 +9,74 @@ import (
 	"syscall"
 
 	pluginv1 "github.com/orchestra-mcp/gen-go/orchestra/plugin/v1"
-	"github.com/orchestra-mcp/sdk-go/plugin"
 	"github.com/orchestra-mcp/plugin-bridge-discord/internal"
-	"github.com/orchestra-mcp/plugin-bridge-discord/internal/storage"
+	"github.com/orchestra-mcp/plugin-bridge-discord/internal/handlers"
+	"github.com/orchestra-mcp/plugin-bridge-discord/internal/tools"
+	"github.com/orchestra-mcp/sdk-go/plugin"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 func main() {
-	builder := plugin.New("tools.bridge-discord").
+	builder := plugin.New("bridge.discord").
 		Version("0.1.0").
-		Description("bridge-discord tools plugin").
+		Description("Discord bridge plugin for Orchestra MCP").
 		Author("Orchestra").
-		Binary("bridge-discord").
-		NeedsStorage("markdown")
+		Binary("bridge-discord")
 
-	adapter := &clientAdapter{}
-	store := storage.NewDataStorage(adapter)
+	cfg := internal.LoadConfig()
+	bot := internal.NewBot(cfg, nil)
 
-	tp := &internal.ToolsPlugin{Storage: store}
-	tp.RegisterTools(builder)
+	// Wire up handler registration (avoids import cycle in internal)
+	bot.SetHandlerRegistrar(func(r *internal.Router) {
+		chat := handlers.NewChatHandler()
+		r.Register(chat)
+		r.SetDefault(chat)
+		r.Register(handlers.NewMcpHandler())
+		r.Register(handlers.NewStatusHandler())
+		r.Register(handlers.NewToolsHandler())
+		r.Register(handlers.NewStopHandler())
+		r.Register(handlers.NewProgressHandler())
+		r.Register(handlers.NewPingHandler())
+		r.Register(handlers.NewPermissionHandler())
+	})
+
+	// Register MCP tools
+	bp := &internal.BridgePlugin{Bot: bot}
+	tools.RegisterAll(builder, bp)
 
 	p := builder.BuildWithTools()
 	p.ParseFlags()
-	adapter.plugin = p
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Wire lazy caller — uses OrchestratorClient once Run() connects.
+	bot.SetCaller(func(name string, args map[string]any) (string, error) {
+		client := p.OrchestratorClient()
+		if client == nil {
+			return "", fmt.Errorf("not connected to orchestrator")
+		}
+		argsStruct, _ := structpb.NewStruct(args)
+		resp, err := client.Send(ctx, &pluginv1.PluginRequest{
+			Request: &pluginv1.PluginRequest_ToolCall{
+				ToolCall: &pluginv1.ToolRequest{
+					ToolName:  name,
+					Arguments: argsStruct,
+				},
+			},
+		})
+		if err != nil {
+			return "", err
+		}
+		tc := resp.GetToolCall()
+		if tc == nil {
+			return "", fmt.Errorf("unexpected response for tool %s", name)
+		}
+		if !tc.Success {
+			return "", fmt.Errorf("%s: %s", tc.ErrorCode, tc.ErrorMessage)
+		}
+		return internal.ExtractText(tc.Result), nil
+	})
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -42,19 +85,16 @@ func main() {
 		cancel()
 	}()
 
+	// Start bot in background if configured
+	if cfg.Enabled && cfg.IsValid() {
+		go func() {
+			if err := bot.Start(ctx); err != nil {
+				log.Printf("[discord] bot error: %v", err)
+			}
+		}()
+	}
+
 	if err := p.Run(ctx); err != nil {
-		log.Fatalf("tools.bridge-discord: %v", err)
+		log.Fatalf("bridge.discord: %v", err)
 	}
-}
-
-type clientAdapter struct {
-	plugin *plugin.Plugin
-}
-
-func (a *clientAdapter) Send(ctx context.Context, req *pluginv1.PluginRequest) (*pluginv1.PluginResponse, error) {
-	client := a.plugin.OrchestratorClient()
-	if client == nil {
-		return nil, fmt.Errorf("orchestrator client not connected")
-	}
-	return client.Send(ctx, req)
 }
